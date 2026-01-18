@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 直播 TTS (WebSocket Hook & Filter UI v1.6)
 // @namespace    https://github.com/biuuu/Bilibili-Live-TTS
-// @version      1.6.0
+// @version      1.6.1
 // @description  通过Hook WebSocket实现B站直播数据过滤和语音播报（弹幕、礼物、SC、上舰、入场等），支持队列、模板、去重、合并、黑白名单、语速音量、外部TTS API、整点报时。
 // @author       biuuu & gemini-2.5-pro-exp-03-25
 // @match        *://live.bilibili.com/*
@@ -63,9 +63,59 @@
     const ttsQueue = []; let isSpeaking = false; let currentAudioElement = null;
     const recentSuperchatIds = new Map(); const recentDanmu = new Map(); const recentGiftCombos = new Map();
     let hourlyChimeTimeoutId = null; // 新增：报时 Timeout ID
+    const userCache = new Map(); // 新增：用户ID到用户名的缓存
 
     // --- Brotli 加载 (代码同前) ---
     try { import("https://unpkg.com/brotli-wasm@3.0.1/index.web.js?module").then(b=>b.default).then(b=>{brotliDecode=b.decompress;brotliReady=true;while(brotliQueue.length>0){const{event,ws}=brotliQueue.shift();handleMessage(event,ws);}}).catch(e=>console.error("[Bili TTS] Brotli fail:",e)); } catch(e){console.error("[Bili TTS] Import Brotli fail:",e);}
+
+    // --- Protobuf 简易解码器 (用于解析 INTERACT_WORD_V2) ---
+    const ProtoUtils = {
+        decodeBase64: (str) => {
+            const s = window.atob(str);
+            const bytes = new Uint8Array(s.length);
+            for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+            return bytes;
+        },
+        readVarint: (buf, offset) => {
+            let res = 0n, shift = 0n;
+            let count = 0;
+            while (true) {
+                const b = buf[offset + count];
+                count++;
+                res |= BigInt(b & 0x7F) << shift;
+                shift += 7n;
+                if ((b & 0x80) === 0) break;
+            }
+            return { value: res, length: count };
+        },
+        readString: (buf, offset, len) => {
+            return new TextDecoder().decode(buf.slice(offset, offset + len));
+        },
+        parse: (buf) => {
+            const res = {};
+            let off = 0;
+            while (off < buf.length) {
+                const { value: tag, length: tagLen } = ProtoUtils.readVarint(buf, off);
+                off += tagLen;
+                const field = Number(tag >> 3n);
+                const type = Number(tag & 7n);
+                if (type === 0) {
+                    const { value, length } = ProtoUtils.readVarint(buf, off);
+                    off += length;
+                    res[field] = value;
+                } else if (type === 2) {
+                    const { value: lenBig, length: lenLen } = ProtoUtils.readVarint(buf, off);
+                    const len = Number(lenBig);
+                    off += lenLen;
+                    res[field] = { start: off, length: len, buffer: buf };
+                    off += len;
+                } else if (type === 5) off += 4;
+                else if (type === 1) off += 8;
+                else break;
+            }
+            return res;
+        }
+    };
 
     // --- WebSocket Hook (代码同前) ---
     const originalWebSocket=unsafeWindow.WebSocket; unsafeWindow.WebSocket=function(...a){const w=new originalWebSocket(...a);w.binaryType='arraybuffer';const l=function(e){if(e.data instanceof ArrayBuffer){const d=new DataView(e.data);if(e.data.byteLength<16)return; const p=d.getUint16(6);if(p===3){if(brotliReady)handleMessage(e,w);else brotliQueue.push({event:e,ws:w});}else handleMessage(e,w);}}; w.addEventListener('message',l); w.addEventListener('close',()=>w.removeEventListener('message',l)); w.addEventListener('error',(r)=>{console.error('[Bili TTS] WS Error:',r);w.removeEventListener('message',l);}); return w;}; unsafeWindow.WebSocket.prototype=originalWebSocket.prototype; unsafeWindow.WebSocket.prototype.constructor=unsafeWindow.WebSocket; for(let k in originalWebSocket)if(originalWebSocket.hasOwnProperty(k)){try{unsafeWindow.WebSocket[k]=originalWebSocket[k];}catch(e){}}
@@ -73,10 +123,126 @@
     // --- 消息解码 (代码同前) ---
     function decodeMessage(b){const d=new DataView(b);const pL=d.getUint32(0);const hL=d.getUint16(4);const pV=d.getUint16(6);const op=d.getUint32(8);if(pL<hL||pL>b.byteLength)return null;const bd=b.slice(hL,pL);try{switch(pV){case 0:return JSON.parse(new TextDecoder().decode(bd));case 1:if(op===3&&bd.byteLength>=4)return{cmd:'POPULARITY',popularity:new DataView(bd).getUint32(0)};else if(op===8)return JSON.parse(new TextDecoder().decode(bd));return null;case 2:{const t=new TextDecoder().decode(pako.inflate(new Uint8Array(bd)));const m=[];let s=0,c=0,iS=false;for(let i=0;i<t.length;i++){const h=t[i];if(h==='"'&&(i===0||t[i-1]!=='\\'))iS=!iS;if(!iS){if(h==='{'){if(c===0)s=i;c++;}else if(h==='}'){c--;if(c===0&&s!==-1){try{m.push(JSON.parse(t.substring(s,i+1)));}catch(e){}s=-1;}}}}return m.length>0?m:null;} case 3:{if(!brotliDecode)return null;const dec=brotliDecode(new Uint8Array(bd));let o=0;const ms=[];while(o<dec.length){const pV=new DataView(dec.buffer,dec.byteOffset+o);const sL=pV.getUint32(0);const sH=pV.getUint16(4);if(o+sL>dec.length||sL<sH){break;}const sB=dec.slice(o+sH,o+sL);try{ms.push(JSON.parse(new TextDecoder().decode(sB)));}catch(e){} o+=sL;}return ms.length>0?ms:null;} default:return null;}}catch(e){console.error("[Bili TTS] Decode Err:",e);return null;}}
 
+    function updateUserCache(uid, username) {
+        if (uid && username && !username.includes('...')) {
+            userCache.set(uid, username);
+            if (userCache.size > 2000) {
+                 const firstKey = userCache.keys().next().value;
+                 userCache.delete(firstKey);
+            }
+        }
+    }
+
     // --- 消息处理与分发 (代码同前 v1.5) ---
     function handleMessage(e,w){if(!(e.data instanceof ArrayBuffer))return;let d;try{d=decodeMessage(e.data);}catch(e){console.error("[Bili TTS] Decode Fail:",e);return;}if(!d)return;const p=(a)=>{if(a&&a.cmd)processData(a);};if(Array.isArray(d))d.forEach(p);else p(d);}
-    function processData(data){if(!settings.enabled)return;let speakText=null;let filterCategory=null;let itemData={};let templateKey=null;let shouldProcess=true;let skipImmediateSpeak=false;try{switch(data.cmd){case'DANMU_MSG':{filterCategory='danmu';templateKey='danmu';if(!settings.filters.danmu.enabled){shouldProcess=false;break;}const info=data.info;const text=info[1];const uid=info[2][0];const username=info[2][1];const medalInfo=info[3];const hasMedal=!!(medalInfo&&medalInfo.length>0&&medalInfo[1]);const medalLevel=hasMedal?medalInfo[0]:0;if(settings.filters.danmu.danmuDebounceEnabled){const now=Date.now();const debounceTimeMs=settings.filters.danmu.danmuDebounceTime*1000;if(recentDanmu.has(text)){if(now-recentDanmu.get(text)<debounceTimeMs){shouldProcess=false;break;}}recentDanmu.set(text,now);setTimeout(()=>{if(recentDanmu.get(text)===now)recentDanmu.delete(text);},debounceTimeMs+500);}itemData={type:'danmu',uid,username,text,hasMedal,medalLevel};break;} case'SEND_GIFT':{filterCategory='gift';templateKey='gift';skipImmediateSpeak=true;if(!settings.filters.gift.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.uname;const giftId=d.giftId;const giftName=d.giftName;const count=d.num;const action=d.action;const totalCoin=d.total_coin;const coinType=d.coin_type;const price=coinType==='gold'?totalCoin/1000:0;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;if(coinType!=='gold'||price<settings.filters.gift.minPrice){shouldProcess=false;break;}const comboKey=`${uid}:${giftId}`;const existingCombo=recentGiftCombos.get(comboKey);if(existingCombo){clearTimeout(existingCombo.timeoutId);existingCombo.count+=count;existingCombo.action=action;const newTimeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Combo)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);existingCombo.timeoutId=newTimeoutId;}else{const initData={uid,username,giftId,giftName,count,price,hasMedal,medalLevel,action};const timeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData&&cData.count===initData.count){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Single)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);recentGiftCombos.set(comboKey,{...initData,timeoutId});}shouldProcess=false;break;} case'SUPER_CHAT_MESSAGE':{filterCategory='superchat';templateKey='superchat';if(!settings.filters.superchat.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.user_info.uname;const text=d.message;const price=d.price;const scId=d.id;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;const now=Date.now();if(recentSuperchatIds.has(scId)){shouldProcess=false;break;}recentSuperchatIds.set(scId,now);setTimeout(()=>{if(recentSuperchatIds.get(scId)===now)recentSuperchatIds.delete(scId);},1000);if(price<settings.filters.superchat.minPrice){shouldProcess=false;break;}itemData={type:'superchat',uid,username,text,price,scId,hasMedal,medalLevel};break;} case'SUPER_CHAT_MESSAGE_JPN':{shouldProcess=false;break;} case'GUARD_BUY':{filterCategory='guard';shouldProcess=false;break;} case'USER_TOAST_MSG':{filterCategory='guard';templateKey='guard';if(!settings.filters.guard.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.username;const level=d.guard_level;const levelName=d.role_name;const num=d.num||1;const unit=d.unit||'';const hasMedal=false;const medalLevel=0;if((level===1&&!settings.filters.guard.level1)||(level===2&&!settings.filters.guard.level2)||(level===3&&!settings.filters.guard.level3)){shouldProcess=false;break;}itemData={type:'guard',uid,username,level,levelName,num,unit,hasMedal,medalLevel};break;} case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';if(!settings.filters.interact.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.uname;const msgType=d.msg_type;const medalInfo=d.fans_medal;const hasMedal=!!(medalInfo&&medalInfo.medal_name&&medalInfo.is_lighted===1);const medalLevel=hasMedal?medalInfo.medal_level:0;let actionText='';let typeFlag='';if(msgType===1&&settings.filters.interact.typeEnter){actionText='进入直播间';typeFlag='enter';}else if(msgType===2&&settings.filters.interact.typeFollow){actionText='关注了主播';typeFlag='follow';}else if(msgType===3&&settings.filters.interact.typeShare){actionText='分享了直播间';typeFlag='share';}else{shouldProcess=false;break;}itemData={type:'interact',uid,username,msgType,hasMedal,medalLevel,typeFlag,actionText};break;} default:shouldProcess=false;break;}}catch(e){console.error("[Bili TTS] Error processing cmd:",data.cmd,e,data);return;} if(!shouldProcess||!itemData.uid||!filterCategory||!templateKey||skipImmediateSpeak)return; if(isUserBlocked(itemData.uid,itemData.username))return; if(passesCategoryFilters(itemData,filterCategory)){speakText=formatTemplate(settings.templates[templateKey],itemData);if(speakText){console.log(`[Bili TTS Speak Queue] ${speakText}`);queueSpeak(speakText);}}}
+    function processData(data){if(!settings.enabled)return;let speakText=null;let filterCategory=null;let itemData={};let templateKey=null;let shouldProcess=true;let skipImmediateSpeak=false;try{switch(data.cmd){case'DANMU_MSG':{filterCategory='danmu';templateKey='danmu';if(!settings.filters.danmu.enabled){shouldProcess=false;break;}const info=data.info;const text=info[1];const uid=info[2][0];const username=info[2][1];updateUserCache(uid, username);const medalInfo=info[3];const hasMedal=!!(medalInfo&&medalInfo.length>0&&medalInfo[1]);const medalLevel=hasMedal?medalInfo[0]:0;if(settings.filters.danmu.danmuDebounceEnabled){const now=Date.now();const debounceTimeMs=settings.filters.danmu.danmuDebounceTime*1000;if(recentDanmu.has(text)){if(now-recentDanmu.get(text)<debounceTimeMs){shouldProcess=false;break;}}recentDanmu.set(text,now);setTimeout(()=>{if(recentDanmu.get(text)===now)recentDanmu.delete(text);},debounceTimeMs+500);}itemData={type:'danmu',uid,username,text,hasMedal,medalLevel};break;} case'SEND_GIFT':{filterCategory='gift';templateKey='gift';skipImmediateSpeak=true;if(!settings.filters.gift.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.uname;updateUserCache(uid, username);const giftId=d.giftId;const giftName=d.giftName;const count=d.num;const action=d.action;const totalCoin=d.total_coin;const coinType=d.coin_type;const price=coinType==='gold'?totalCoin/1000:0;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;if(coinType!=='gold'||price<settings.filters.gift.minPrice){shouldProcess=false;break;}const comboKey=`${uid}:${giftId}`;const existingCombo=recentGiftCombos.get(comboKey);if(existingCombo){clearTimeout(existingCombo.timeoutId);existingCombo.count+=count;existingCombo.action=action;const newTimeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Combo)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);existingCombo.timeoutId=newTimeoutId;}else{const initData={uid,username,giftId,giftName,count,price,hasMedal,medalLevel,action};const timeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData&&cData.count===initData.count){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Single)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);recentGiftCombos.set(comboKey,{...initData,timeoutId});}shouldProcess=false;break;} case'SUPER_CHAT_MESSAGE':{filterCategory='superchat';templateKey='superchat';if(!settings.filters.superchat.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.user_info.uname;updateUserCache(uid, username);const text=d.message;const price=d.price;const scId=d.id;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;const now=Date.now();if(recentSuperchatIds.has(scId)){shouldProcess=false;break;}recentSuperchatIds.set(scId,now);setTimeout(()=>{if(recentSuperchatIds.get(scId)===now)recentSuperchatIds.delete(scId);},1000);if(price<settings.filters.superchat.minPrice){shouldProcess=false;break;}itemData={type:'superchat',uid,username,text,price,scId,hasMedal,medalLevel};break;} case'SUPER_CHAT_MESSAGE_JPN':{shouldProcess=false;break;} case'GUARD_BUY':{filterCategory='guard';shouldProcess=false;break;} case'USER_TOAST_MSG':{filterCategory='guard';templateKey='guard';if(!settings.filters.guard.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.username;updateUserCache(uid, username);const level=d.guard_level;const levelName=d.role_name;const num=d.num||1;const unit=d.unit||'';const hasMedal=false;const medalLevel=0;if((level===1&&!settings.filters.guard.level1)||(level===2&&!settings.filters.guard.level2)||(level===3&&!settings.filters.guard.level3)){shouldProcess=false;break;}itemData={type:'guard',uid,username,level,levelName,num,unit,hasMedal,medalLevel};break;} case'INTERACT_WORD_V2':
+case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';const d=data.data;
 
+    // 如果存在 pb 字段，尝试进行 Protobuf 解码并填充 d 对象
+    if (d.pb) {
+        try {
+            const pbData = ProtoUtils.parse(ProtoUtils.decodeBase64(d.pb));
+
+            if (pbData[1]) d.uid = Number(pbData[1]); // Tag 1: uid
+            if (pbData[2] && pbData[2].buffer) d.uname = ProtoUtils.readString(pbData[2].buffer, pbData[2].start, pbData[2].length); // Tag 2: uname
+            if (pbData[5]) d.msg_type = Number(pbData[5]); // Tag 5: msg_type
+
+            // Tag 9: fans_medal (Nested Message)
+            if (pbData[9] && pbData[9].buffer) {
+                const medalBuf = pbData[9].buffer.slice(pbData[9].start, pbData[9].start + pbData[9].length);
+                const medalData = ProtoUtils.parse(medalBuf);
+                d.fans_medal = {
+                    medal_name: (medalData[1] && medalData[1].buffer) ? ProtoUtils.readString(medalData[1].buffer, medalData[1].start, medalData[1].length) : '',
+                    medal_level: (medalData[2] && typeof medalData[2] === 'bigint') ? Number(medalData[2]) : 0,
+                    is_lighted: (medalData[6] && typeof medalData[6] === 'bigint') ? Number(medalData[6]) : 1
+                };
+            }
+        } catch (e) {
+            console.error('[Bili TTS] PB Decode Error:', e);
+        }
+    }
+
+    // 兼容 V2 更加复杂的嵌套结构，尝试从不同路径提取 UID 和用户名
+    const uid = d.uid || (d.uinfo && d.uinfo.base && d.uinfo.base.uid);
+    const username = d.uname || (d.uinfo && d.uinfo.base && d.uinfo.base.name);
+    const msgType = d.msg_type;
+
+    if (uid && username) updateUserCache(uid, username);
+
+    if(!settings.filters.interact.enabled){shouldProcess=false;break;}
+
+    // 兼容粉丝勋章路径
+    const m = d.fans_medal || (d.uinfo && d.uinfo.medal);
+    const hasMedal = !!(m && (m.medal_name || m.name) && (m.is_lighted === 1 || m.is_light === 1));
+    const medalLevel = hasMedal ? (m.medal_level || m.level || 0) : 0;
+
+            let actionText='';let typeFlag='';
+
+            if(msgType==1&&settings.filters.interact.typeEnter){actionText='进入直播间';typeFlag='enter';}
+
+            else if(msgType==2){
+            if(settings.filters.interact.typeFollow){actionText='关注了主播';typeFlag='follow';}
+            else{shouldProcess=false;break;}
+        }else if(msgType==3&&settings.filters.interact.typeShare){actionText='分享了直播间';typeFlag='share';}
+        else{shouldProcess=false;break;}
+
+        itemData={type:'interact',uid,username,msgType,hasMedal,medalLevel,typeFlag,actionText};break;}
+
+        // --- 新增 DM_INTERACTION 支持 (解决关注不播报) ---
+        case 'DM_INTERACTION': {
+        const d = data.data;
+        const payloadStr = d.payload;
+        if (!payloadStr) break;
+        try {
+            const pl = JSON.parse(new TextDecoder().decode(ProtoUtils.decodeBase64(payloadStr)));
+            console.log('[Bili TTS] DM_INTERACTION Payload:', pl);
+        } catch(e) {
+             try {
+                const pbData = ProtoUtils.parse(ProtoUtils.decodeBase64(payloadStr));
+                console.log('[Bili TTS] DM_INTERACTION PB Decode:', pbData);
+             } catch (e2) {
+                 console.log('[Bili TTS] DM_INTERACTION Decode Fail', e, e2);
+             }
+        }
+        break;
+    }
+
+    // --- 新增: 尝试从 NOTICE_MSG / SYS_MSG 中提取关注信息 (保底方案) ---
+    case 'NOTICE_MSG':
+    case 'SYS_MSG': {
+        if (!settings.filters.interact.enabled || !settings.filters.interact.typeFollow) break;
+        const msg = data.msg_text || data.msg || '';
+        // 典型文本: "XXX 关注了主播"
+        if (msg.includes('关注了主播')) {
+            console.log('[Bili TTS] Fallback Follow Detect:', msg);
+            // 尝试提取用户名
+            const match = /^(.*?) 关注了主播/.exec(msg);
+            if (match) {
+                const username = match[1];
+                // 构造伪造的 interact 数据
+                itemData = {
+                    type: 'interact',
+                    uid: 0, // 这种消息通常没有 UID
+                    username: username,
+                    msgType: 2, // 伪造为关注类型
+                    hasMedal: false, 
+                    medalLevel: 0,
+                    typeFlag: 'follow',
+                    actionText: '关注了主播'
+                };
+                filterCategory = 'interact';
+                templateKey = 'interact';
+                // 跳过后续的 isUserBlocked 检查 (因为没有 UID)
+                // 直接在这里处理并 break，或者让它流转下去 (需要注意 UID 0 的处理)
+                
+                                // 由于下方有 `if(!itemData.uid)` 检查，这里我们需要特殊处理
+                                // 或者我们可以给一个伪造的负数 UID 避免被过滤
+                                itemData.uid = -1; 
+                            }
+                        }
+                        break;
+                    }
+    default:shouldProcess=false;break;}}catch(e){console.error("[Bili TTS] Error processing cmd:",data.cmd,e,data);return;} if(!shouldProcess||!itemData.uid||!filterCategory||!templateKey||skipImmediateSpeak)return; if(isUserBlocked(itemData.uid,itemData.username))return; if(passesCategoryFilters(itemData,filterCategory)){speakText=formatTemplate(settings.templates[templateKey],itemData);if(speakText){console.log(`[Bili TTS Speak Queue] ${speakText}`);queueSpeak(speakText);}}}
     // --- Filtering Logic (unchanged from v1.4) ---
     function parseFilterList(str){if(!str)return[];return str.split(/[\n,]+/).map(s=>s.trim().toLowerCase()).filter(s=>s);}
     function isUserBlocked(uid,username){const bIds=parseFilterList(settings.globalBlockUserIds).map(id=>parseInt(id)).filter(id=>!isNaN(id));if(bIds.includes(uid))return true;const bKw=parseFilterList(settings.globalBlockKeywords);const lUn=username?username.toLowerCase():'';if(bKw.some(kw=>lUn.includes(kw)))return true;return false;}

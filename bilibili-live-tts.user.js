@@ -114,6 +114,34 @@
                 else break;
             }
             return res;
+        },
+        // 与 parse 相同，但保留重复字段的所有出现（用于解析 gift_list 等 repeated message）
+        parseRepeated: (buf) => {
+            const res = {};
+            let off = 0;
+            while (off < buf.length) {
+                const { value: tag, length: tagLen } = ProtoUtils.readVarint(buf, off);
+                off += tagLen;
+                const field = Number(tag >> 3n);
+                const type = Number(tag & 7n);
+                let val;
+                if (type === 0) {
+                    const { value, length } = ProtoUtils.readVarint(buf, off);
+                    off += length;
+                    val = value;
+                } else if (type === 2) {
+                    const { value: lenBig, length: lenLen } = ProtoUtils.readVarint(buf, off);
+                    const len = Number(lenBig);
+                    off += lenLen;
+                    val = { start: off, length: len, buffer: buf };
+                    off += len;
+                } else if (type === 5) { off += 4; continue; }
+                else if (type === 1) { off += 8; continue; }
+                else break;
+                if (!res[field]) res[field] = [];
+                res[field].push(val);
+            }
+            return res;
         }
     };
 
@@ -135,7 +163,7 @@
 
     // --- 消息处理与分发 (代码同前 v1.5) ---
     function handleMessage(e,w){if(!(e.data instanceof ArrayBuffer))return;let d;try{d=decodeMessage(e.data);}catch(e){console.error("[Bili TTS] Decode Fail:",e);return;}if(!d)return;const p=(a)=>{if(a&&a.cmd)processData(a);};if(Array.isArray(d))d.forEach(p);else p(d);}
-    function processData(data){if(!settings.enabled)return;let speakText=null;let filterCategory=null;let itemData={};let templateKey=null;let shouldProcess=true;let skipImmediateSpeak=false;try{switch(data.cmd){case'DANMU_MSG':{filterCategory='danmu';templateKey='danmu';if(!settings.filters.danmu.enabled){shouldProcess=false;break;}const info=data.info;const text=info[1];const uid=info[2][0];const username=info[2][1];updateUserCache(uid, username);const medalInfo=info[3];const hasMedal=!!(medalInfo&&medalInfo.length>0&&medalInfo[1]);const medalLevel=hasMedal?medalInfo[0]:0;if(settings.filters.danmu.danmuDebounceEnabled){const now=Date.now();const debounceTimeMs=settings.filters.danmu.danmuDebounceTime*1000;if(recentDanmu.has(text)){if(now-recentDanmu.get(text)<debounceTimeMs){shouldProcess=false;break;}}recentDanmu.set(text,now);setTimeout(()=>{if(recentDanmu.get(text)===now)recentDanmu.delete(text);},debounceTimeMs+500);}itemData={type:'danmu',uid,username,text,hasMedal,medalLevel};break;} case'SEND_GIFT':{filterCategory='gift';templateKey='gift';skipImmediateSpeak=true;if(!settings.filters.gift.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.uname;updateUserCache(uid, username);const giftId=d.giftId;const giftName=d.giftName;const count=d.num;const action=d.action;const totalCoin=d.total_coin;const coinType=d.coin_type;const price=coinType==='gold'?totalCoin/1000:0;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;if(coinType!=='gold'||price<settings.filters.gift.minPrice){shouldProcess=false;break;}const comboKey=`${uid}:${giftId}`;const existingCombo=recentGiftCombos.get(comboKey);if(existingCombo){clearTimeout(existingCombo.timeoutId);existingCombo.count+=count;existingCombo.action=action;const newTimeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Combo)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);existingCombo.timeoutId=newTimeoutId;}else{const initData={uid,username,giftId,giftName,count,price,hasMedal,medalLevel,action};const timeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData&&cData.count===initData.count){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Single)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);recentGiftCombos.set(comboKey,{...initData,timeoutId});}shouldProcess=false;break;} case'SUPER_CHAT_MESSAGE':{filterCategory='superchat';templateKey='superchat';if(!settings.filters.superchat.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.user_info.uname;updateUserCache(uid, username);const text=d.message;const price=d.price;const scId=d.id;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;const now=Date.now();if(recentSuperchatIds.has(scId)){shouldProcess=false;break;}recentSuperchatIds.set(scId,now);setTimeout(()=>{if(recentSuperchatIds.get(scId)===now)recentSuperchatIds.delete(scId);},1000);if(price<settings.filters.superchat.minPrice){shouldProcess=false;break;}itemData={type:'superchat',uid,username,text,price,scId,hasMedal,medalLevel};break;} case'SUPER_CHAT_MESSAGE_JPN':{shouldProcess=false;break;} case'GUARD_BUY':{filterCategory='guard';shouldProcess=false;break;} case'USER_TOAST_MSG':{filterCategory='guard';templateKey='guard';if(!settings.filters.guard.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.username;updateUserCache(uid, username);const level=d.guard_level;const levelName=d.role_name;const num=d.num||1;const unit=d.unit||'';const hasMedal=false;const medalLevel=0;if((level===1&&!settings.filters.guard.level1)||(level===2&&!settings.filters.guard.level2)||(level===3&&!settings.filters.guard.level3)){shouldProcess=false;break;}itemData={type:'guard',uid,username,level,levelName,num,unit,hasMedal,medalLevel};break;} case'INTERACT_WORD_V2':
+    function processData(data){if(!settings.enabled)return;let speakText=null;let filterCategory=null;let itemData={};let templateKey=null;let shouldProcess=true;let skipImmediateSpeak=false;try{switch(data.cmd){case'DANMU_MSG':{filterCategory='danmu';templateKey='danmu';if(!settings.filters.danmu.enabled){shouldProcess=false;break;}const info=data.info;const text=info[1];const uid=info[2][0];const username=info[2][1];updateUserCache(uid, username);const medalInfo=info[3];const hasMedal=!!(medalInfo&&medalInfo.length>0&&medalInfo[1]);const medalLevel=hasMedal?medalInfo[0]:0;if(settings.filters.danmu.danmuDebounceEnabled){const now=Date.now();const debounceTimeMs=settings.filters.danmu.danmuDebounceTime*1000;if(recentDanmu.has(text)){if(now-recentDanmu.get(text)<debounceTimeMs){shouldProcess=false;break;}}recentDanmu.set(text,now);setTimeout(()=>{if(recentDanmu.get(text)===now)recentDanmu.delete(text);},debounceTimeMs+500);}itemData={type:'danmu',uid,username,text,hasMedal,medalLevel};break;} case'SEND_GIFT':{filterCategory='gift';templateKey='gift';skipImmediateSpeak=true;if(!settings.filters.gift.enabled){shouldProcess=false;break;}const d=data.data;if(d.pb){try{const root=ProtoUtils.parseRepeated(ProtoUtils.decodeBase64(d.pb));const uid=(root[1]&&root[1][0]!==undefined)?Number(root[1][0]):d.uid;const uField=root[2]&&root[2][0];const username=(uField&&uField.buffer)?ProtoUtils.readString(uField.buffer,uField.start,uField.length):d.uname;let hasMedal=false,medalLevel=0;const medalField=root[8]&&root[8][0];if(medalField&&medalField.buffer){const medalBuf=medalField.buffer.slice(medalField.start,medalField.start+medalField.length);const medalData=ProtoUtils.parse(medalBuf);medalLevel=medalData[5]!==undefined?Number(medalData[5]):0;const medalNameField=medalData[6];const medalName=(medalNameField&&medalNameField.buffer)?ProtoUtils.readString(medalNameField.buffer,medalNameField.start,medalNameField.length):'';hasMedal=!!medalName;}const giftItems=root[10]||[];giftItems.forEach(item=>{if(!item.buffer)return;const gi=ProtoUtils.parse(item.buffer.slice(item.start,item.start+item.length));const giftId=gi[1]!==undefined?Number(gi[1]):0;const nameField=gi[2];const giftName=(nameField&&nameField.buffer)?ProtoUtils.readString(nameField.buffer,nameField.start,nameField.length):'';const count=gi[3]!==undefined?Number(gi[3]):1;const totalCoin=gi[7]!==undefined?Number(gi[7]):0;const coinTypeField=gi[8];const coinType=(coinTypeField&&coinTypeField.buffer)?ProtoUtils.readString(coinTypeField.buffer,coinTypeField.start,coinTypeField.length):'';const actionField=gi[18];const action=(actionField&&actionField.buffer)?ProtoUtils.readString(actionField.buffer,actionField.start,actionField.length):'赠送';handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel);});}catch(e){console.error('[Bili TTS] Gift PB Decode Error:',e);}}else{const uid=d.uid;const username=d.uname;const giftId=d.giftId;const giftName=d.giftName;const count=d.num;const action=d.action;const totalCoin=d.total_coin;const coinType=d.coin_type;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel);}shouldProcess=false;break;} case'SUPER_CHAT_MESSAGE':{filterCategory='superchat';templateKey='superchat';if(!settings.filters.superchat.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.user_info.uname;updateUserCache(uid, username);const text=d.message;const price=d.price;const scId=d.id;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;const now=Date.now();if(recentSuperchatIds.has(scId)){shouldProcess=false;break;}recentSuperchatIds.set(scId,now);setTimeout(()=>{if(recentSuperchatIds.get(scId)===now)recentSuperchatIds.delete(scId);},1000);if(price<settings.filters.superchat.minPrice){shouldProcess=false;break;}itemData={type:'superchat',uid,username,text,price,scId,hasMedal,medalLevel};break;} case'SUPER_CHAT_MESSAGE_JPN':{shouldProcess=false;break;} case'GUARD_BUY':{filterCategory='guard';shouldProcess=false;break;} case'USER_TOAST_MSG':{filterCategory='guard';templateKey='guard';if(!settings.filters.guard.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.username;updateUserCache(uid, username);const level=d.guard_level;const levelName=d.role_name;const num=d.num||1;const unit=d.unit||'';const hasMedal=false;const medalLevel=0;if((level===1&&!settings.filters.guard.level1)||(level===2&&!settings.filters.guard.level2)||(level===3&&!settings.filters.guard.level3)){shouldProcess=false;break;}itemData={type:'guard',uid,username,level,levelName,num,unit,hasMedal,medalLevel};break;} case'INTERACT_WORD_V2':
 case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';const d=data.data;
 
     // 如果存在 pb 字段，尝试进行 Protobuf 解码并填充 d 对象
@@ -243,6 +271,27 @@ case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';const d=da
                         break;
                     }
     default:shouldProcess=false;break;}}catch(e){console.error("[Bili TTS] Error processing cmd:",data.cmd,e,data);return;} if(!shouldProcess||!itemData.uid||!filterCategory||!templateKey||skipImmediateSpeak)return; if(isUserBlocked(itemData.uid,itemData.username))return; if(passesCategoryFilters(itemData,filterCategory)){speakText=formatTemplate(settings.templates[templateKey],itemData);if(speakText){console.log(`[Bili TTS Speak Queue] ${speakText}`);queueSpeak(speakText);}}}
+    // --- 礼物过滤 + 连击合并 (供 SEND_GIFT 的 JSON/Protobuf 两种数据来源共用) ---
+    function handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel){
+        if(!uid||!giftId)return;
+        updateUserCache(uid,username);
+        const price=coinType==='gold'?totalCoin/1000:0;
+        if(coinType!=='gold'||price<settings.filters.gift.minPrice)return;
+        const comboKey=`${uid}:${giftId}`;
+        const existingCombo=recentGiftCombos.get(comboKey);
+        if(existingCombo){
+            clearTimeout(existingCombo.timeoutId);
+            existingCombo.count+=count;
+            existingCombo.price+=price;
+            existingCombo.action=action;
+            const newTimeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Combo)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);
+            existingCombo.timeoutId=newTimeoutId;
+        }else{
+            const initData={uid,username,giftId,giftName,count,price,hasMedal,medalLevel,action};
+            const timeoutId=setTimeout(()=>{const cData=recentGiftCombos.get(comboKey);if(cData&&cData.count===initData.count){const fData={type:'gift',...cData};if(!isUserBlocked(fData.uid,fData.username)&&passesCategoryFilters(fData,'gift')){const txt=formatTemplate(settings.templates.gift,fData);if(txt){console.log(`[Bili TTS Speak Queue] ${txt} (Single)`);queueSpeak(txt);}}recentGiftCombos.delete(comboKey);}},GIFT_COMBO_TIMEOUT);
+            recentGiftCombos.set(comboKey,{...initData,timeoutId});
+        }
+    }
     // --- Filtering Logic (unchanged from v1.4) ---
     function parseFilterList(str){if(!str)return[];return str.split(/[\n,]+/).map(s=>s.trim().toLowerCase()).filter(s=>s);}
     function isUserBlocked(uid,username){const bIds=parseFilterList(settings.globalBlockUserIds).map(id=>parseInt(id)).filter(id=>!isNaN(id));if(bIds.includes(uid))return true;const bKw=parseFilterList(settings.globalBlockKeywords);const lUn=username?username.toLowerCase():'';if(bKw.some(kw=>lUn.includes(kw)))return true;return false;}

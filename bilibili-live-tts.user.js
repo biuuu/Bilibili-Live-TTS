@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 直播 TTS (WebSocket Hook & Filter UI v1.6)
 // @namespace    https://github.com/biuuu/Bilibili-Live-TTS
-// @version      1.6.1
+// @version      1.6.2
 // @description  通过Hook WebSocket实现B站直播数据过滤和语音播报（弹幕、礼物、SC、上舰、入场等），支持队列、模板、去重、合并、黑白名单、语速音量、外部TTS API、整点报时。
 // @author       biuuu & gemini-2.5-pro-exp-03-25
 // @match        *://live.bilibili.com/*

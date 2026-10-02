@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili 直播 TTS (WebSocket Hook & Filter UI v1.6)
 // @namespace    https://github.com/biuuu/Bilibili-Live-TTS
-// @version      1.6.3
+// @version      1.6.4
 // @description  通过Hook WebSocket实现B站直播数据过滤和语音播报（弹幕、礼物、SC、上舰、入场等），支持队列、模板、去重、合并、黑白名单、语速音量、外部TTS API、整点报时。
 // @author       biuuu & gemini-2.5-pro-exp-03-25
 // @match        *://live.bilibili.com/*
@@ -145,6 +145,78 @@
         }
     };
 
+    function normalizeCommand(command) {
+        return typeof command === 'string' ? command.split(':', 1)[0] : command;
+    }
+
+    function decodeGiftV2(data) {
+        try {
+            const root = ProtoUtils.parseRepeated(ProtoUtils.decodeBase64(data.pb));
+            const uid = root[1] && root[1][0] !== undefined ? Number(root[1][0]) : data.uid;
+            const usernameField = root[2] && root[2][0];
+            const username = usernameField && usernameField.buffer
+                ? ProtoUtils.readString(usernameField.buffer, usernameField.start, usernameField.length)
+                : data.uname;
+            const medalField = root[8] && root[8][0];
+            const medalData = medalField && medalField.buffer
+                ? ProtoUtils.parse(medalField.buffer.slice(medalField.start, medalField.start + medalField.length))
+                : {};
+            const medalNameField = medalData[6];
+            const medalInfo = {
+                medal_name: medalNameField && medalNameField.buffer
+                    ? ProtoUtils.readString(medalNameField.buffer, medalNameField.start, medalNameField.length)
+                    : '',
+                medal_level: medalData[5] !== undefined ? Number(medalData[5]) : 0
+            };
+            const blindField = root[9] && root[9][0];
+            const blindData = blindField && blindField.buffer
+                ? ProtoUtils.parse(blindField.buffer.slice(blindField.start, blindField.start + blindField.length))
+                : {};
+            const blindNameField = blindData[3];
+            const blindGiftName = blindNameField && blindNameField.buffer
+                ? ProtoUtils.readString(blindNameField.buffer, blindNameField.start, blindNameField.length)
+                : '';
+            const blindGiftPrice = blindData[6] !== undefined ? Number(blindData[6]) : 0;
+
+            return (root[10] || []).flatMap(item => {
+                if (!item.buffer) return [];
+                const gift = ProtoUtils.parse(item.buffer.slice(item.start, item.start + item.length));
+                const giftNameField = gift[2];
+                const giftName = giftNameField && giftNameField.buffer
+                    ? ProtoUtils.readString(giftNameField.buffer, giftNameField.start, giftNameField.length)
+                    : '';
+                const count = gift[3] !== undefined ? Number(gift[3]) : 1;
+                const totalCoin = gift[7] !== undefined ? Number(gift[7]) : blindGiftPrice * count;
+                const coinTypeField = gift[8];
+                const coinType = coinTypeField && coinTypeField.buffer
+                    ? ProtoUtils.readString(coinTypeField.buffer, coinTypeField.start, coinTypeField.length)
+                    : (blindGiftPrice > 0 ? 'gold' : '');
+                const actionField = gift[18];
+                const action = actionField && actionField.buffer
+                    ? ProtoUtils.readString(actionField.buffer, actionField.start, actionField.length)
+                    : '赠送';
+
+                return [{
+                    cmd: 'SEND_GIFT',
+                    data: {
+                        uid,
+                        uname: username,
+                        giftId: gift[1] !== undefined ? Number(gift[1]) : blindGiftName,
+                        giftName: blindGiftName || giftName,
+                        num: count,
+                        action,
+                        total_coin: totalCoin,
+                        coin_type: coinType,
+                        medal_info: medalInfo
+                    }
+                }];
+            });
+        } catch (error) {
+            console.error('[Bili TTS] Gift V2 Decode Error:', error);
+            return null;
+        }
+    }
+
     // --- WebSocket Hook (代码同前) ---
     const originalWebSocket=unsafeWindow.WebSocket; unsafeWindow.WebSocket=function(...a){const w=new originalWebSocket(...a);w.binaryType='arraybuffer';const l=function(e){if(e.data instanceof ArrayBuffer){const d=new DataView(e.data);if(e.data.byteLength<16)return; const p=d.getUint16(6);if(p===3){if(brotliReady)handleMessage(e,w);else brotliQueue.push({event:e,ws:w});}else handleMessage(e,w);}}; w.addEventListener('message',l); w.addEventListener('close',()=>w.removeEventListener('message',l)); w.addEventListener('error',(r)=>{console.error('[Bili TTS] WS Error:',r);w.removeEventListener('message',l);}); return w;}; unsafeWindow.WebSocket.prototype=originalWebSocket.prototype; unsafeWindow.WebSocket.prototype.constructor=unsafeWindow.WebSocket; for(let k in originalWebSocket)if(originalWebSocket.hasOwnProperty(k)){try{unsafeWindow.WebSocket[k]=originalWebSocket[k];}catch(e){}}
 
@@ -162,7 +234,7 @@
     }
 
     // --- 消息处理与分发 (代码同前 v1.5) ---
-    function handleMessage(e,w){if(!(e.data instanceof ArrayBuffer))return;let d;try{d=decodeMessage(e.data);}catch(e){console.error("[Bili TTS] Decode Fail:",e);return;}if(!d)return;const p=(a)=>{if(a&&a.cmd)processData(a);};if(Array.isArray(d))d.forEach(p);else p(d);}
+    function handleMessage(e,w){if(!(e.data instanceof ArrayBuffer))return;let d;try{d=decodeMessage(e.data);}catch(e){console.error("[Bili TTS] Decode Fail:",e);return;}if(!d)return;const p=(a)=>{if(!a||!a.cmd)return;const command=normalizeCommand(a.cmd);if(command==='SEND_GIFT_V2'&&a.data&&a.data.pb){const gifts=decodeGiftV2(a.data);if(gifts!==null){gifts.forEach(processData);return;}}processData(command===a.cmd?a:{...a,cmd:command});};if(Array.isArray(d))d.forEach(p);else p(d);}
     function processData(data){if(!settings.enabled)return;let speakText=null;let filterCategory=null;let itemData={};let templateKey=null;let shouldProcess=true;let skipImmediateSpeak=false;try{switch(data.cmd){case'DANMU_MSG':{filterCategory='danmu';templateKey='danmu';if(!settings.filters.danmu.enabled){shouldProcess=false;break;}const info=data.info;const text=info[1];const uid=info[2][0];const username=info[2][1];updateUserCache(uid, username);const medalInfo=info[3];const hasMedal=!!(medalInfo&&medalInfo.length>0&&medalInfo[1]);const medalLevel=hasMedal?medalInfo[0]:0;if(settings.filters.danmu.danmuDebounceEnabled){const now=Date.now();const debounceTimeMs=settings.filters.danmu.danmuDebounceTime*1000;if(recentDanmu.has(text)){if(now-recentDanmu.get(text)<debounceTimeMs){shouldProcess=false;break;}}recentDanmu.set(text,now);setTimeout(()=>{if(recentDanmu.get(text)===now)recentDanmu.delete(text);},debounceTimeMs+500);}itemData={type:'danmu',uid,username,text,hasMedal,medalLevel};break;} case'SEND_GIFT':
 case'SEND_GIFT_V2':{filterCategory='gift';templateKey='gift';skipImmediateSpeak=true;if(!settings.filters.gift.enabled){shouldProcess=false;break;}const d=data.data;if(d.pb){try{const root=ProtoUtils.parseRepeated(ProtoUtils.decodeBase64(d.pb));const uid=(root[1]&&root[1][0]!==undefined)?Number(root[1][0]):d.uid;const uField=root[2]&&root[2][0];const username=(uField&&uField.buffer)?ProtoUtils.readString(uField.buffer,uField.start,uField.length):d.uname;let hasMedal=false,medalLevel=0;const medalField=root[8]&&root[8][0];if(medalField&&medalField.buffer){const medalBuf=medalField.buffer.slice(medalField.start,medalField.start+medalField.length);const medalData=ProtoUtils.parse(medalBuf);medalLevel=medalData[5]!==undefined?Number(medalData[5]):0;const medalNameField=medalData[6];const medalName=(medalNameField&&medalNameField.buffer)?ProtoUtils.readString(medalNameField.buffer,medalNameField.start,medalNameField.length):'';hasMedal=!!medalName;}const giftItems=root[10]||[];giftItems.forEach(item=>{if(!item.buffer)return;const gi=ProtoUtils.parse(item.buffer.slice(item.start,item.start+item.length));const giftId=gi[1]!==undefined?Number(gi[1]):0;const nameField=gi[2];const giftName=(nameField&&nameField.buffer)?ProtoUtils.readString(nameField.buffer,nameField.start,nameField.length):'';const count=gi[3]!==undefined?Number(gi[3]):1;const totalCoin=gi[7]!==undefined?Number(gi[7]):0;const coinTypeField=gi[8];const coinType=(coinTypeField&&coinTypeField.buffer)?ProtoUtils.readString(coinTypeField.buffer,coinTypeField.start,coinTypeField.length):'';const actionField=gi[18];const action=(actionField&&actionField.buffer)?ProtoUtils.readString(actionField.buffer,actionField.start,actionField.length):'赠送';handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel);});}catch(e){console.error('[Bili TTS] Gift PB Decode Error:',e);}}else{const uid=d.uid;const username=d.uname;const giftId=d.giftId;const giftName=d.giftName;const count=d.num;const action=d.action;const totalCoin=d.total_coin;const coinType=d.coin_type;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel);}shouldProcess=false;break;} case'SUPER_CHAT_MESSAGE':{filterCategory='superchat';templateKey='superchat';if(!settings.filters.superchat.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.user_info.uname;updateUserCache(uid, username);const text=d.message;const price=d.price;const scId=d.id;const medalInfo=d.medal_info;const hasMedal=!!(medalInfo&&medalInfo.medal_name);const medalLevel=hasMedal?medalInfo.medal_level:0;const now=Date.now();if(recentSuperchatIds.has(scId)){shouldProcess=false;break;}recentSuperchatIds.set(scId,now);setTimeout(()=>{if(recentSuperchatIds.get(scId)===now)recentSuperchatIds.delete(scId);},1000);if(price<settings.filters.superchat.minPrice){shouldProcess=false;break;}itemData={type:'superchat',uid,username,text,price,scId,hasMedal,medalLevel};break;} case'SUPER_CHAT_MESSAGE_JPN':{shouldProcess=false;break;} case'GUARD_BUY':{filterCategory='guard';shouldProcess=false;break;} case'USER_TOAST_MSG':{filterCategory='guard';templateKey='guard';if(!settings.filters.guard.enabled){shouldProcess=false;break;}const d=data.data;const uid=d.uid;const username=d.username;updateUserCache(uid, username);const level=d.guard_level;const levelName=d.role_name;const num=d.num||1;const unit=d.unit||'';const hasMedal=false;const medalLevel=0;if((level===1&&!settings.filters.guard.level1)||(level===2&&!settings.filters.guard.level2)||(level===3&&!settings.filters.guard.level3)){shouldProcess=false;break;}itemData={type:'guard',uid,username,level,levelName,num,unit,hasMedal,medalLevel};break;} case'INTERACT_WORD_V2':
 case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';const d=data.data;
@@ -274,11 +346,13 @@ case'INTERACT_WORD':{filterCategory='interact';templateKey='interact';const d=da
     default:shouldProcess=false;break;}}catch(e){console.error("[Bili TTS] Error processing cmd:",data.cmd,e,data);return;} if(!shouldProcess||!itemData.uid||!filterCategory||!templateKey||skipImmediateSpeak)return; if(isUserBlocked(itemData.uid,itemData.username))return; if(passesCategoryFilters(itemData,filterCategory)){speakText=formatTemplate(settings.templates[templateKey],itemData);if(speakText){console.log(`[Bili TTS Speak Queue] ${speakText}`);queueSpeak(speakText);}}}
     // --- 礼物过滤 + 连击合并 (供 SEND_GIFT 的 JSON/Protobuf 两种数据来源共用) ---
     function handleGiftEvent(uid,username,giftId,giftName,count,action,totalCoin,coinType,hasMedal,medalLevel){
-        if(!uid||!giftId)return;
+        const giftKey=giftId||giftName;
+        if(!uid||!giftKey)return;
         updateUserCache(uid,username);
-        const price=coinType==='gold'?totalCoin/1000:0;
-        if(coinType!=='gold'||price<settings.filters.gift.minPrice)return;
-        const comboKey=`${uid}:${giftId}`;
+        const normalizedCoinType=typeof coinType==='string'?coinType.toLowerCase():'';
+        const price=(!normalizedCoinType||normalizedCoinType==='gold')?totalCoin/1000:0;
+        if((normalizedCoinType&&normalizedCoinType!=='gold')||price<settings.filters.gift.minPrice)return;
+        const comboKey=`${uid}:${giftKey}`;
         const existingCombo=recentGiftCombos.get(comboKey);
         if(existingCombo){
             clearTimeout(existingCombo.timeoutId);
